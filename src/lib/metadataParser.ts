@@ -93,7 +93,31 @@ function parseID3v2(buf: Uint8Array): Meta {
       try{
         let me=1; while(me<data.length&&data[me]!==0)me++;
         const mime=lstr(data,1,me-1)||'image/jpeg';
-        let ds2=me+2; while(ds2<data.length&&data[ds2]!==0)ds2++; ds2++;
+        // BUG FIX (corrupted/undecodable embedded art): the byte right after
+        // the mime type is the picture-type byte, then a free-text
+        // "description" string, then the raw image bytes. That description
+        // is encoded per the frame's own `enc` byte (same as the title/
+        // artist text above) -- and taggers commonly write it as UTF-16
+        // (enc 1/2), same as they do for TIT2/TPE1. A UTF-16 string's null
+        // terminator is TWO 0x00 bytes, not one, and can't be found by
+        // scanning for a single 0x00: any ASCII character in UTF-16LE (e.g.
+        // "cover" -> 63 00 6f 00 76 00 65 00 72 00 00 00) already contains
+        // plenty of lone 0x00 bytes. Scanning for a single 0x00 terminator
+        // regardless of encoding stops after the very first character,
+        // leaving the back half of the description sitting right before
+        // the real image bytes -- so what got stored as "image data" was a
+        // handful of leftover description bytes glued onto the front of an
+        // otherwise-valid JPEG/PNG, which no decoder can make sense of.
+        // Text frames (TIT2 etc, handled by `rt()` above) never hit this
+        // because they don't have a separate description field to skip
+        // over in the first place.
+        let ds2=me+2;
+        if(enc===1||enc===2){
+          while(ds2+1<data.length&&!(data[ds2]===0&&data[ds2+1]===0))ds2+=2;
+          ds2 = ds2+1<data.length ? ds2+2 : data.length;
+        } else {
+          while(ds2<data.length&&data[ds2]!==0)ds2++; ds2++;
+        }
         const pic=data.slice(ds2);
         if(pic.length>100){meta.artData=pic.buffer.slice(pic.byteOffset,pic.byteOffset+pic.byteLength);meta.artMime=mime;}
       }catch{}
