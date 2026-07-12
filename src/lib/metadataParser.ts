@@ -27,9 +27,39 @@ function readExtendedFloat80(b: Uint8Array, o: number): number {
 
 export interface Meta { title?: string; artist?: string; album?: string; duration?: number; kbps?: number; artData?: ArrayBuffer; artMime?: string; }
 
+// ID3v2's "unsynchronisation" scheme stuffs a 0x00 byte after every 0xFF
+// byte that would otherwise look like an MPEG frame sync marker (FF Ex) or
+// just FF 00, so a naive MP3 player scanning for sync bits inside the tag
+// doesn't get confused. Plenty of real-world taggers set this (it's the
+// default in several encoders), and it has to be undone before frame
+// content is used. Text frames are mostly ASCII/extended-latin and rarely
+// contain the FF-then-{00,Ex} pattern, so titles/artists usually come
+// through fine either way -- but a JPEG cover literally starts with
+// FF D8 FF E0/E1 and is dense binary data throughout, so it's very likely
+// to contain that pattern repeatedly. Leaving it un-desynced means the
+// image bytes have extra 0x00s spliced in at random points and the decoded
+// image is corrupt (browser <img> fails to render it, silently falling
+// back to the letter-tile placeholder) even though the tag was read and
+// the art frame was found.
+function desync(b: Uint8Array): Uint8Array {
+  let hasStuffing = false;
+  for (let i = 0; i < b.length - 1; i++) { if (b[i] === 0xFF && b[i + 1] === 0x00) { hasStuffing = true; break; } }
+  if (!hasStuffing) return b;
+  const out = new Uint8Array(b.length);
+  let w = 0;
+  for (let i = 0; i < b.length; i++) {
+    out[w++] = b[i];
+    if (b[i] === 0xFF && b[i + 1] === 0x00) i++;
+  }
+  return out.subarray(0, w);
+}
+
 function parseID3v2(buf: Uint8Array): Meta {
   if (buf[0]!==0x49||buf[1]!==0x44||buf[2]!==0x33) return {};
   const ver=buf[3]; const tagSize=sync(buf,6);
+  // Header flags byte: bit 0x80 = whole tag was unsynchronised at write
+  // time (applies to every frame's content, v2.3 and v2.4 alike).
+  const globalUnsync = (buf[5] & 0x80) !== 0;
   const meta:Meta={}; let pos=10; const end=Math.min(10+tagSize,buf.length);
   const fl=ver===2?3:4; const hdr=fl+(ver===2?3:4)+(ver===2?0:2);
   while(pos+hdr<end) {
@@ -40,7 +70,17 @@ function parseID3v2(buf: Uint8Array): Meta {
     else sz=u32be(buf,pos+4);
     const ds=pos+hdr; const de=ds+sz;
     if(sz<=0||de>end) break;
-    const data=buf.slice(ds,de); const enc=data[0]; const tb=data.slice(1);
+    // v2.4 also allows a *per-frame* unsynchronisation flag (independent of
+    // the tag-level one) plus an optional 4-byte "data length indicator"
+    // prefix that some encoders always emit alongside it -- skip that
+    // prefix (it describes the post-desync length, which we don't need
+    // since desync() recomputes it) so it doesn't get parsed as content.
+    const flags2 = ver===4 ? buf[pos+hdr-1] : 0;
+    const frameUnsync = globalUnsync || (flags2 & 0x02) !== 0;
+    const hasDataLenIndicator = ver===4 && (flags2 & 0x01) !== 0;
+    let raw = buf.slice(hasDataLenIndicator ? ds+4 : ds, de);
+    const data = frameUnsync ? desync(raw) : raw;
+    const enc=data[0]; const tb=data.slice(1);
     const rt=()=>{
       if(enc===1||enc===2){try{return new TextDecoder('utf-16').decode(tb).replace(/\0/g,'').trim();}catch{return '';}}
       if(enc===3) return utf8(tb);
